@@ -39,10 +39,10 @@ const time_t HEARTBEAT_INTERVAL_S = 3600;     // Log "alive" every hour
 const uint64_t US_PR_SECOND = 1000000ULL;
 
 // ---------- MQTT ----------
-// led:    {"colour":"green","smiley":":-D","value":1,"ledAlreadyOn":true,"ledOnColour":"blue",
+// button: {"colour":"green","smiley":":-D","value":1,"ledAlreadyOn":true,"ledOnColour":"blue",
 //          "timestamp":"2026-11-25T10:15:30+01:00"}
 // status: {"status":"awake","timestamp":"2026-11-25T10:15:30+01:00"}  (started / awake / sleep / alive)
-const char *TOPIC_LED = "elever/casper/smileypanel/led";
+const char *TOPIC_BUTTON = "elever/casper/smileypanel/button";
 const char *TOPIC_STATUS = "elever/casper/smileypanel/status";
 const unsigned long WIFI_TIMEOUT_MS = 10000;
 const unsigned long MQTT_RETRY_MS = 5000;
@@ -60,12 +60,12 @@ const time_t VALID_TIME = 1700000000;  // Any time before this means the clock i
 enum Status : uint8_t { STATUS_STARTED, STATUS_AWAKE, STATUS_SLEEP, STATUS_ALIVE };
 const char *STATUS_NAMES[] = {"started", "awake", "sleep", "alive"};
 
-enum EventType : uint8_t { EVENT_STATUS, EVENT_LED };
+enum EventType : uint8_t { EVENT_STATUS, EVENT_BUTTON };
 struct Event {
   time_t time;
   EventType type;
-  uint8_t code;     // Status, or index in FEEDBACK for an LED event
-  int8_t ledOn;     // Index in FEEDBACK of the LED that was already on, or NO_LED
+  uint8_t code;     // Status, or index in FEEDBACK for a button event
+  int8_t ledOn;     // Index in FEEDBACK of the LED that was already on when the button was pressed, or NO_LED
 };
 const int QUEUE_SIZE = 64;  // When full, the oldest message is dropped
 
@@ -77,7 +77,7 @@ RTC_DATA_ATTR Event queue[QUEUE_SIZE];
 RTC_DATA_ATTR int queueStart = 0;
 RTC_DATA_ATTR int queueCount = 0;
 
-int litLed = NO_LED;
+int litLed = NO_LED;                    // Index in FEEDBACK of the LED that is on, or NO_LED
 unsigned long litSinceMs = 0;
 unsigned long lastActivityMs = 0;
 unsigned long lastMqttAttemptMs = 0;
@@ -125,14 +125,16 @@ const char *buildJson(const Event &event, char *json, size_t size) {
   }
 
   const Feedback &pressed = FEEDBACK[event.code];
+  // Colour of the LED that was already on, as a JSON string, or null
   char ledOnColour[16] = "null";
   if (event.ledOn != NO_LED) snprintf(ledOnColour, sizeof(ledOnColour), "\"%s\"", FEEDBACK[event.ledOn].colour);
+
   snprintf(json, size,
            "{\"colour\":\"%s\",\"smiley\":\"%s\",\"value\":%d,"
            "\"ledAlreadyOn\":%s,\"ledOnColour\":%s,\"timestamp\":\"%s\"}",
            pressed.colour, pressed.smiley, pressed.value,
            event.ledOn != NO_LED ? "true" : "false", ledOnColour, timestamp);
-  return TOPIC_LED;
+  return TOPIC_BUTTON;
 }
 
 // ---------- WiFi and MQTT ----------
@@ -170,24 +172,26 @@ void turnOffLed() {
   litLed = NO_LED;
 }
 
-// Registers a press and lights its LED. A new press takes over from an LED that is already on.
+// Registers every press. Only one LED is on at a time, and it always gets its full LED_ON_MS:
+// a press while an LED is on is registered (with the colour that is on), but lights nothing.
 void registerPress(int index) {
-  enqueue(EVENT_LED, index, litLed);
-  turnOffLed();
-  digitalWrite(FEEDBACK[index].ledPin, HIGH);
-  litLed = index;
-  litSinceMs = millis();
+  enqueue(EVENT_BUTTON, index, litLed);
+  if (litLed == NO_LED) {
+    digitalWrite(FEEDBACK[index].ledPin, HIGH);
+    litLed = index;
+    litSinceMs = millis();
+  }
   lastActivityMs = millis();
   pressedSinceBoot = true;
 }
 
-// Reads the buttons and turns the LED off after LED_ON_MS. Never waits, so no press is missed.
+// Turns the LED off after LED_ON_MS and reads the buttons. Never waits, so no press is missed.
 void pollButtons() {
+  if (litLed != NO_LED && millis() - litSinceMs >= LED_ON_MS) turnOffLed();
   for (int i = 0; i < BUTTON_COUNT; i++) {
     buttons[i].loop();
     if (buttons[i].isPressed()) registerPress(i);
   }
-  if (litLed != NO_LED && millis() - litSinceMs >= LED_ON_MS) turnOffLed();
 }
 
 // ---------- Startup steps that take time (the buttons are read while waiting) ----------
