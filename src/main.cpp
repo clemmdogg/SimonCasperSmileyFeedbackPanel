@@ -6,6 +6,15 @@
 #include "esp_sleep.h"
 #include "secrets.h"
 
+// TLS (encrypted MQTT) is used on port 8883, unless secrets.h says otherwise with MQTT_USE_TLS
+#ifndef MQTT_USE_TLS
+#define MQTT_USE_TLS (MQTT_PORT == 8883)
+#endif
+#if MQTT_USE_TLS
+#include <WiFiClientSecure.h>
+#include "mqtt_ca.h"
+#endif
+
 // ---------- Buttons and LEDs ----------
 // What each colour means, sent along with the LED message
 struct Feedback {
@@ -82,8 +91,12 @@ unsigned long litSinceMs = 0;
 unsigned long lastActivityMs = 0;
 unsigned long lastMqttAttemptMs = 0;
 bool pressedSinceBoot = false;
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+#if MQTT_USE_TLS
+WiFiClientSecure netClient;  // Encrypted; checks the broker's certificate against MQTT_CA_CERT
+#else
+WiFiClient netClient;        // Not encrypted
+#endif
+PubSubClient mqtt(netClient);
 
 // ---------- Queue ----------
 
@@ -147,8 +160,18 @@ bool connectMqtt() {
   bool ok = (strlen(MQTT_USER) > 0)
                 ? mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)
                 : mqtt.connect(clientId.c_str());
-  Serial.printf("MQTT connect: %s\n", ok ? "OK" : "failed");
-  return ok;
+  if (ok) {
+    Serial.println("MQTT connect: OK");
+    return true;
+  }
+
+  // state: -2 = no connection to the broker (for TLS also: certificate rejected), 4 = wrong user/password, 5 = not allowed
+  Serial.printf("MQTT connect: failed (state %d)\n", mqtt.state());
+#if MQTT_USE_TLS
+  char tlsError[100];
+  if (netClient.lastError(tlsError, sizeof(tlsError)) != 0) Serial.printf("  TLS error: %s\n", tlsError);
+#endif
+  return false;
 }
 
 // Send queued messages, oldest first. Stops at the first one that fails.
@@ -265,6 +288,7 @@ void setup() {
 
   startUps++;
   Serial.printf("Startup no. %d\n", startUps);
+  Serial.printf("MQTT: %s on port %d\n", MQTT_USE_TLS ? "TLS (encrypted, certificate checked)" : "NOT encrypted", MQTT_PORT);
 
   // Register the press that woke us straight away, before WiFi, so the LED lights at once
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -276,6 +300,9 @@ void setup() {
     }
   }
 
+#if MQTT_USE_TLS
+  netClient.setCACert(MQTT_CA_CERT);
+#endif
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   connectWifi();
   syncClock();
